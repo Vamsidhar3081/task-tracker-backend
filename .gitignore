@@ -1,0 +1,13 @@
+# dependencies
+node_modules/
+
+# environment variables
+.env
+
+# editor / AI tools
+.vscode/
+.windsurf/
+.cursor/
+
+# OS files
+Thumbs.db
