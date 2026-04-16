@@ -30,7 +30,7 @@ npm install
 PORT=5000
 DB_HOST=localhost
 DB_USER=root
-DB_PASSWORD=yourpassword
+DB_PASS=yourpassword
 DB_NAME=flowtasks
 JWT_SECRET=your_secret_key
 ```
