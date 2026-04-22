@@ -6,7 +6,7 @@ import { db } from "./config/db.js";
 
 const PORT = process.env.PORT || 5000;
 
-// ✅ Start server ONLY after DB is verified
+// Start server ONLY after DB is verified
 const startServer = async () => {
   try {
     const [rows] = await db.query("SELECT 1");
