@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import authRoutes from './routes/auth.router.js';
+import aiRoutes from './routes/ai.router.js';
 
 const app = express();
 
@@ -18,6 +19,7 @@ app.use(
 app.use(express.json());
 
 app.use("/api/auth", authRoutes);
+app.use("/api/ai", aiRoutes);
 
 
 export default app;

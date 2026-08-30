@@ -55,6 +55,12 @@ const delayTaskSchema = joi
   })
   .unknown(false);
 
+const aiTaskQuerySchema = joi
+  .object({
+    question: joi.string().trim().min(3).max(1000).required(),
+  })
+  .unknown(false);
+
 export {
   registerSchema,
   createUserSchema,
@@ -62,4 +68,5 @@ export {
   createTasksSchema,
   updateTasksSchema,
   delayTaskSchema,
+  aiTaskQuerySchema,
 };
