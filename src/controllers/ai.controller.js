@@ -1,28 +1,17 @@
 import OpenAI from "openai";
+import { z } from "zod";
 import { db } from "../config/db.js";
+import { embed } from "../services/embeddings.js";
+import { searchSimilar } from "../services/vectorStore.js";
 
-const INTENTS = [
-  "LIST_TASKS",
-  "COUNT_TASKS",
-  "USER_STATS",
-  "LIST_OVERDUE_TASKS",
-  "LIST_TASKS_WITH_MIN_DELAYS",
-  "SUMMARIZE_TASK_DELAYS",
-  "UNSUPPORTED",
-];
+const MAX_STEPS = 5;
+const LIST_LIMIT = 50;
+const MODEL_ROWS = 30;
+const REASON_LIMIT = 100;
+const SEARCH_COUNT = 8;
+const MIN_SIMILARITY = 0.2;
 
-const querySchema = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    intent: { type: "string", enum: INTENTS },
-    assignee_name: { type: ["string", "null"] },
-    task_title: { type: ["string", "null"] },
-    min_delays: { type: ["integer", "null"], minimum: 0, maximum: 100 },
-    status: { type: ["string", "null"], enum: ["ONGOING", "DELAYED", "COMPLETED", null] },
-  },
-  required: ["intent", "assignee_name", "task_title", "min_delays", "status"],
-};
+/* ---------- reused helpers (unchanged) ---------- */
 
 const normalize = (value) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
 
@@ -38,11 +27,6 @@ const distance = (left, right) => {
     }
   }
   return row[right.length];
-};
-
-const mentionsUser = (question, name) => {
-  const escaped = name.toLowerCase().trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(^|\\W)${escaped}(?=$|\\W)`, "i").test(question);
 };
 
 const resolveUser = (requestedName, users) => {
@@ -79,16 +63,6 @@ const accessScope = (req, values) => {
   return "t.is_deleted = 0 AND t.assigned_to = ?";
 };
 
-const inferTaskTitle = async (req, question) => {
-  const values = [];
-  const where = accessScope(req, values);
-  const [rows] = await db.query(`SELECT t.id, t.title FROM tasks t WHERE ${where} LIMIT 1000`, values);
-  const normalizedQuestion = normalize(question);
-  return rows
-    .filter((row) => normalizedQuestion.includes(normalize(row.title)))
-    .sort((a, b) => normalize(b.title).length - normalize(a.title).length)[0]?.title || null;
-};
-
 const taskDto = (task) => ({
   id: task.id,
   title: task.title,
@@ -102,155 +76,463 @@ const taskDto = (task) => ({
 const client = () => {
   if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not configured");
   const baseURL = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
-  const model = process.env.OPENAI_MODEL || "gpt-5.4-nano";
-  console.log("AI provider:", baseURL.includes("groq.com") ? "Groq" : "OpenAI");
-  console.log("AI model:", model);
   return new OpenAI({ apiKey: process.env.OPENAI_API_KEY, baseURL });
 };
 
-const interpret = async (question, users) => {
-  const response = await client().responses.create({
-    model: process.env.OPENAI_MODEL || "gpt-5.4-nano",
-    store: false,
-    instructions: "Extract the task tracker operation and filters. Understand any question about tasks or users, including listing, counting, status (ONGOING, DELAYED, COMPLETED), overdue state, assignees, title/description keywords, delay counts, and user workload. Use LIST_TASKS for show/find/what questions, COUNT_TASKS for how-many questions, USER_STATS for user workload questions, and SUMMARIZE_TASK_DELAYS for delay explanations. Never answer the question, invent a person, or invent a task title. Use UNSUPPORTED only for unrelated requests.",
-    input: `Question: ${question}\nVisible users: ${JSON.stringify(users.map(({ name }) => name))}`,
-    text: { format: { type: "json_schema", name: "task_query", strict: true, schema: querySchema } },
-  });
-  return JSON.parse(response.output_text);
-};
+/* ---------- validation (model output is untrusted input) ---------- */
 
-const listTasks = async (req, { overdue = false, assigneeId, assigneeIds, minDelays, delayOperator = ">", status, title }) => {
+const QuerySchema = z.object({
+  mode: z.enum(["count", "list", "stats"]),
+  assignee_names: z.array(z.string()).nullish(),
+  status: z.enum(["ONGOING", "DELAYED", "COMPLETED"]).nullish(),
+  overdue: z.boolean().nullish(),
+  delay_count: z
+    .object({
+      op: z.enum([">", ">=", "<", "<=", "="]),
+      value: z.coerce.number().int().min(0).max(1000),
+    })
+    .nullish(),
+  keyword: z.string().max(100).nullish(),
+});
+
+const HistorySchema = z.object({ task_title: z.string().min(1).max(200) });
+
+const ReasonsSchema = z.object({ assignee_names: z.array(z.string()).nullish() });
+
+const SearchSchema = z.object({ query: z.string().min(1).max(200) });
+
+/* ---------- tool definitions the model sees ---------- */
+
+const tools = [
+  {
+    type: "function",
+    function: {
+      name: "query_tasks",
+      description:
+        "Query tasks with any combination of exact filters. Use mode=count for 'how many', mode=list for 'show/which/list', mode=stats for a user's workload overview (totals by status plus overdue). The keyword filter only matches exact words in the title or description; for topic or meaning questions use search_tasks_by_meaning instead.",
+      parameters: {
+        type: "object",
+        properties: {
+          mode: { type: "string", enum: ["count", "list", "stats"] },
+          assignee_names: {
+            type: "array",
+            items: { type: "string" },
+            description: "Names of assignees as written by the user. Omit for all visible users.",
+          },
+          status: { type: "string", enum: ["ONGOING", "DELAYED", "COMPLETED"] },
+          overdue: { type: "boolean", description: "True for tasks not completed whose due date has passed." },
+          delay_count: {
+            type: "object",
+            description: "Filter by number of recorded delays, e.g. more than 3 delays = {op: '>', value: 3}.",
+            properties: {
+              op: { type: "string", enum: [">", ">=", "<", "<=", "="] },
+              value: { type: "integer", minimum: 0 },
+            },
+            required: ["op", "value"],
+          },
+          keyword: { type: "string", description: "Exact text to match in the task title or description." },
+        },
+        required: ["mode"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_task_delay_history",
+      description:
+        "Get one specific task and its delay history (old date, new date, reason). Use only when the user names a single task and asks why it was delayed or wants a summary of its delays. Do NOT use this for general questions about many tasks; use get_delay_reasons for those.",
+      parameters: {
+        type: "object",
+        properties: { task_title: { type: "string", description: "Title or part of the title of the task." } },
+        required: ["task_title"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_delay_reasons",
+      description:
+        "Use this for ANY general question about why tasks are delayed or what the common delay reasons are. Returns the recorded delay reasons across ALL tasks at once, newest first, each with its task title and assignee. Can also be limited to one or more assignees.",
+      parameters: {
+        type: "object",
+        properties: {
+          assignee_names: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional. Limit to these assignees. Omit for everyone visible.",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_tasks_by_meaning",
+      description:
+        "Find tasks related to a topic or theme by meaning, even when the exact words differ. Use for questions like 'tasks related to payment problems', 'anything about login issues', 'tasks similar to the dashboard work'. Call it once with a short descriptive query that adds only a few closely related terms. Returns tasks ranked by similarity.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Short descriptive phrase with the main topic plus a few closely related terms, e.g. 'payment gateway and checkout problems, online transactions, refunds'." },
+        },
+        required: ["query"],
+      },
+    },
+  },
+];
+
+/* ---------- tool implementations (your code runs these, not the model) ---------- */
+
+const GROUP_BY = "GROUP BY t.id, t.title, t.description, t.status, t.feedback_date, u.name";
+
+const runQueryTasks = async (req, args, users) => {
   const values = [];
   let where = accessScope(req, values);
-  if (overdue) where += " AND t.status != 'COMPLETED' AND t.feedback_date < CURDATE()";
-  if (assigneeId) { where += " AND t.assigned_to = ?"; values.push(assigneeId); }
-  if (Array.isArray(assigneeIds) && assigneeIds.length > 0) { where += ` AND t.assigned_to IN (${assigneeIds.map(() => "?").join(",")})`; values.push(...assigneeIds); }
-  if (status) { where += " AND t.status = ?"; values.push(status); }
-  if (title) { where += " AND (t.title LIKE ? OR t.description LIKE ?)"; values.push(`%${title}%`, `%${title}%`); }
-  let having = "";
-  if (Number.isInteger(minDelays)) {
-    const safeOperator = [">", "<", ">=", "<=", "="].includes(delayOperator) ? delayOperator : ">";
-    having = ` HAVING COUNT(d.id) ${safeOperator} ?`;
-    values.push(minDelays);
-  }
-  console.log("AI SQL task filter:", { overdue, assigneeId, assigneeIds, minDelays, status, title });
 
-  const [tasks] = await db.query(
-    `SELECT t.id, t.title, t.description, t.status, t.feedback_date, assignee.name AS assignee_name, COUNT(d.id) AS delay_count
-     FROM tasks t
-     INNER JOIN users assignee ON assignee.id = t.assigned_to
-     LEFT JOIN task_delays d ON d.task_id = t.id
-     WHERE ${where}
-     GROUP BY t.id, t.title, t.description, t.status, t.feedback_date, assignee.name
-     ${having}
-     ORDER BY t.feedback_date ASC LIMIT 100`,
+  const matchedUsers = [];
+  if (args.assignee_names?.length) {
+    const ids = [];
+    for (const name of args.assignee_names) {
+      const { user, suggestions } = resolveUser(name, users);
+      if (!user) {
+        return { error: `I could not confidently match the user "${name}".`, suggestions: suggestions || [] };
+      }
+      ids.push(user.id);
+      matchedUsers.push(user.name);
+    }
+    where += ` AND t.assigned_to IN (${ids.map(() => "?").join(",")})`;
+    values.push(...ids);
+  }
+  if (args.status) { where += " AND t.status = ?"; values.push(args.status); }
+  if (args.overdue) where += " AND t.status != 'COMPLETED' AND t.feedback_date < CURDATE()";
+  if (args.keyword) {
+    where += " AND (t.title LIKE ? OR t.description LIKE ?)";
+    values.push(`%${args.keyword}%`, `%${args.keyword}%`);
+  }
+
+  let having = "";
+  if (args.delay_count) {
+    having = `HAVING COUNT(d.id) ${args.delay_count.op} ?`; // op is whitelisted by Zod
+    values.push(args.delay_count.value);
+  }
+
+  const base = `FROM tasks t
+    INNER JOIN users u ON u.id = t.assigned_to
+    LEFT JOIN task_delays d ON d.task_id = t.id
+    WHERE ${where}
+    ${GROUP_BY}
+    ${having}`;
+
+  console.log("AI query_tasks:", JSON.stringify(args));
+
+  if (args.mode === "count") {
+    const [[row]] = await db.query(`SELECT COUNT(*) AS count FROM (SELECT t.id ${base}) x`, values);
+    return { matched_users: matchedUsers, count: Number(row.count) };
+  }
+
+  if (args.mode === "stats") {
+    const [[row]] = await db.query(
+      `SELECT COUNT(*) AS total_tasks,
+              COALESCE(SUM(x.status = 'ONGOING'), 0) AS ongoing_tasks,
+              COALESCE(SUM(x.status = 'DELAYED'), 0) AS delayed_tasks,
+              COALESCE(SUM(x.status = 'COMPLETED'), 0) AS completed_tasks,
+              COALESCE(SUM(x.status != 'COMPLETED' AND x.feedback_date < CURDATE()), 0) AS overdue_tasks
+       FROM (SELECT t.id, t.status, t.feedback_date ${base}) x`,
+      values
+    );
+    return {
+      matched_users: matchedUsers,
+      stats: {
+        total_tasks: Number(row.total_tasks),
+        ongoing_tasks: Number(row.ongoing_tasks),
+        delayed_tasks: Number(row.delayed_tasks),
+        completed_tasks: Number(row.completed_tasks),
+        overdue_tasks: Number(row.overdue_tasks),
+      },
+    };
+  }
+
+  const [rows] = await db.query(
+    `SELECT t.id, t.title, t.description, t.status, t.feedback_date,
+            u.name AS assignee_name, COUNT(d.id) AS delay_count
+     ${base}
+     ORDER BY t.feedback_date ASC LIMIT ${LIST_LIMIT}`,
     values
   );
-  const result = tasks.map(taskDto);
-  console.log("AI SQL task result counts:", result.map(({ id, title, delay_count }) => ({ id, title, delay_count })));
-  return result;
+  return { matched_users: matchedUsers, tasks: rows.map(taskDto), truncated: rows.length === LIST_LIMIT };
 };
 
-const summarize = async (task, delays) => {
-  const response = await client().responses.create({
-    model: process.env.OPENAI_MODEL || "gpt-5.4-nano",
-    store: false,
-    instructions: "Write a concise natural-language summary of why this task was delayed. Use only the supplied task and delay-history data. Mention the number of delays and recorded reasons. Do not return JSON, operation names, filters, or code. If there are no delay records, say that no delays are recorded.",
-    input: JSON.stringify({ task: taskDto(task), delays }),
+const runDelayHistory = async (req, { task_title }) => {
+  const values = [];
+  let where = accessScope(req, values);
+  where += " AND t.title LIKE ?";
+  values.push(`%${task_title}%`);
 
+  const [tasks] = await db.query(
+    `SELECT t.id, t.title, t.description, t.status, t.feedback_date,
+            u.name AS assignee_name, COUNT(d.id) AS delay_count
+     FROM tasks t
+     INNER JOIN users u ON u.id = t.assigned_to
+     LEFT JOIN task_delays d ON d.task_id = t.id
+     WHERE ${where}
+     ${GROUP_BY}
+     ORDER BY t.updated_at DESC LIMIT 4`,
+    values
+  );
+  if (tasks.length === 0) return { error: "No matching task was found." };
+
+  const matches = [];
+  for (const task of tasks) {
+    const [delays] = await db.query(
+      "SELECT old_date, new_date, reason, created_at FROM task_delays WHERE task_id = ? ORDER BY created_at ASC",
+      [task.id]
+    );
+    matches.push({ task: taskDto(task), delays });
+  }
+
+  if (matches.length === 1) return matches[0];
+  return { multiple_matches: matches.length, matches };
+};
+
+const runDelayReasons = async (req, args, users) => {
+  const values = [];
+  let where = accessScope(req, values);
+
+  if (args.assignee_names?.length) {
+    const ids = [];
+    for (const name of args.assignee_names) {
+      const { user, suggestions } = resolveUser(name, users);
+      if (!user) {
+        return { error: `I could not confidently match the user "${name}".`, suggestions: suggestions || [] };
+      }
+      ids.push(user.id);
+    }
+    where += ` AND t.assigned_to IN (${ids.map(() => "?").join(",")})`;
+    values.push(...ids);
+  }
+
+  const [rows] = await db.query(
+    `SELECT t.title, u.name AS assignee_name, d.reason, d.old_date, d.new_date, d.created_at
+     FROM task_delays d
+     INNER JOIN tasks t ON t.id = d.task_id
+     INNER JOIN users u ON u.id = t.assigned_to
+     WHERE ${where}
+     ORDER BY d.created_at DESC LIMIT ${REASON_LIMIT}`,
+    values
+  );
+  return { total_delay_entries: rows.length, truncated: rows.length === REASON_LIMIT, delays: rows };
+};
+
+const rerank = async (query, candidates) => {
+  const completion = await client().chat.completions.create({
+    model: process.env.OPENAI_MODEL || "gpt-5.4-nano",
+    temperature: 0,
+    messages: [
+      {
+        role: "system",
+        content:
+          'You judge relevance. Given a topic and a list of tasks, return ONLY a JSON object like {"relevant_ids": [1, 2]} with the ids of tasks whose title or description is genuinely about the topic. Judge only by the task text. Return an empty list if none are relevant.',
+      },
+      {
+        role: "user",
+        content: JSON.stringify({
+          topic: query,
+          tasks: candidates.map(({ id, title, description }) => ({ id, title, description })),
+        }),
+      },
+    ],
   });
-  return response.output_text;
+  const text = completion.choices[0].message.content || "";
+  const json = text.match(/\{[\s\S]*\}/);
+  if (!json) throw new Error("No JSON in rerank reply");
+  return new Set(JSON.parse(json[0]).relevant_ids.map(Number));
+};
+
+const runSemanticSearch = async (req, { query }) => {
+  console.log("AI semantic search:", query);
+  const ownerId = req.user.role === "ADMIN" ? null : req.user.id;
+  const found = await searchSimilar(await embed(query), { ownerId, count: SEARCH_COUNT });
+  console.log("AI semantic scores:", found.map((m) => `${m.task_id}:${m.similarity.toFixed(3)}`).join("  "));
+  const matches = found.filter((m) => m.similarity >= MIN_SIMILARITY);
+  if (matches.length === 0) return { tasks: [], message: "No tasks related to that topic were found." };
+
+  // Re-check permissions in MySQL: only tasks the current user may see come back.
+  const values = [];
+  let where = accessScope(req, values);
+  where += ` AND t.id IN (${matches.map(() => "?").join(",")})`;
+  values.push(...matches.map((m) => m.task_id));
+
+  const [rows] = await db.query(
+    `SELECT t.id, t.title, t.description, t.status, t.feedback_date,
+            u.name AS assignee_name, COUNT(d.id) AS delay_count
+     FROM tasks t
+     INNER JOIN users u ON u.id = t.assigned_to
+     LEFT JOIN task_delays d ON d.task_id = t.id
+     WHERE ${where}
+     ${GROUP_BY}`,
+    values
+  );
+
+  const score = new Map(matches.map((m) => [m.task_id, m.similarity]));
+  const tasks = rows
+    .map((row) => ({ ...taskDto(row), similarity: Number((score.get(row.id) ?? 0).toFixed(3)) }))
+    .sort((a, b) => b.similarity - a.similarity);
+    let kept = tasks;
+  try {
+    const relevantIds = await rerank(query, tasks);
+    kept = tasks.filter((t) => relevantIds.has(Number(t.id)));
+  } catch (error) {
+    console.error("Rerank failed, using similarity only:", error?.message);
+  }
+  console.log("AI semantic kept:", kept.map((t) => t.id).join(","));
+  if (kept.length === 0) return { tasks: [], message: "No tasks related to that topic were found." };
+  return { tasks: kept };
+};
+
+/* ---------- keep what the model reads small and cheap ---------- */
+
+const forModel = (data) => {
+  if (!data.tasks) return data;
+  return {
+    ...data,
+    total_returned: data.tasks.length,
+    tasks: data.tasks.slice(0, MODEL_ROWS).map(({ description, ...rest }) => rest),
+  };
+};
+
+/* ---------- the assistant loop ---------- */
+
+const systemPrompt = (req, users) => `You are the assistant of a task tracker. Today's date is ${new Date().toISOString().slice(0, 10)}.
+Rules:
+- When ranking causes, rank by the number of entries in each group, highest first, and check the numbers before stating which is most common.
+- Always use the tools to get data. Never guess counts, names or task details.
+- Valid statuses: ONGOING, DELAYED, COMPLETED. "Overdue" means not completed and past its due date: use the overdue filter, not a status.
+- "Delays" are the recorded delay entries of a task. Use delay_count for questions like "delayed more than 3 times".
+- Use mode=count for "how many", mode=list for "show/which/list", mode=stats for a user's workload overview.
+- When the user asks for several numbers at once, such as total, completed, delayed and overdue tasks, call query_tasks once with mode=stats instead of several count calls, then report every number from the result.
+- For questions about a topic or theme, such as "tasks related to payment problems", "anything about login issues" or "tasks similar to X", call search_tasks_by_meaning once. Write the query as a short descriptive phrase about the topic, adding only a few closely related terms, for example "payment gateway and checkout problems, online transactions, refunds" for a payment question, or "login page problems, sign in failures" for a login question. Do not add loosely related words. Do NOT try several keyword guesses with query_tasks for these. Only mention tasks that were returned, and say that results are ranked by similarity, so the last ones may be only loosely related. If none are returned, say no related tasks were found.
+- For ANY general question about why tasks are delayed, common delay reasons, or delay patterns, you MUST call get_delay_reasons first and only. Do NOT call query_tasks or get_task_delay_history for these questions. After it returns, describe only what the returned reasons say: group similar reasons, mention how many entries there are, and quote the actual reasons. Do not explain how the system works and do not add reasons that are not in the data. If the reasons are unclear or meaningless, say so. Start by stating the total number of entries. Put every entry in exactly one group, and make sure the group counts add up to the total before answering; if they don't, recount.
+- To explain why one specific named task was delayed, call get_task_delay_history and summarize only the returned data. Mention the number of delays and the recorded reasons. If there are none, say no delays are recorded. If several tasks match the title, say so and summarize each one separately, naming its assignee and description.
+- If a tool returns an error or suggestions, tell the user and ask them to clarify. Never invent users or tasks.
+- If the question is unrelated to tasks, say you can only help with task questions.
+- Keep answers short. Full task lists are shown to the user separately, so give the key number or a one-line summary instead of repeating every task. If results are truncated, say so.
+- ${req.user.role === "ADMIN" ? "The current user is an admin and can see all users." : "The current user is a regular user and can only see their own tasks."}
+Known users: ${JSON.stringify(users.map((u) => u.name).slice(0, 200))}`;
+
+const runAssistant = async (req, question, users) => {
+  const ai = client();
+  const model = process.env.OPENAI_MODEL || "gpt-5.4-nano";
+  const messages = [
+    { role: "system", content: systemPrompt(req, users) },
+    { role: "user", content: question },
+  ];
+  let last = null;
+  const results = []
+
+  for (let step = 0; step < MAX_STEPS; step += 1) {
+    const completion = await ai.chat.completions.create({
+      model,
+      temperature: 0,
+      tools,
+      tool_choice: "auto",
+      messages,
+    });
+    const msg = completion.choices[0].message;
+    if (!msg.tool_calls?.length) return { answer: msg.content || "", last ,results};
+
+    messages.push({ role: "assistant", content: msg.content ?? "", tool_calls: msg.tool_calls });
+
+    for (const call of msg.tool_calls) {
+      let data;
+      let args = null;
+      console.log("AI tool call:", call.function.name, call.function.arguments);
+      try {
+        const raw = JSON.parse(call.function.arguments || "{}");
+        if (call.function.name === "query_tasks") {
+          args = QuerySchema.parse(raw);
+          data = await runQueryTasks(req, args, users);
+        } else if (call.function.name === "get_task_delay_history") {
+          args = HistorySchema.parse(raw);
+          data = await runDelayHistory(req, args);
+        } else if (call.function.name === "get_delay_reasons") {
+          args = ReasonsSchema.parse(raw);
+          data = await runDelayReasons(req, args, users);
+        } else if (call.function.name === "search_tasks_by_meaning") {
+          args = SearchSchema.parse(raw);
+          data = await runSemanticSearch(req, args);
+        } else {
+          data = { error: `Unknown tool: ${call.function.name}` };
+        }
+      } catch (error) {
+        console.error("Tool call failed:", call.function.name, error?.message);
+        data = {
+          error:
+            error instanceof z.ZodError
+              ? `Invalid arguments: ${error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`
+              : "The tool failed to run.",
+        };
+      }
+      last = { name: call.function.name, args, data };
+      results.push(last);
+      messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(forModel(data)) });
+    }
+  }
+  return { answer: "I could not finish answering that. Please try rephrasing your question.", last, results };
+};
+
+/* ---------- route handler ---------- */
+
+const legacyIntent = (name, args) => {
+  if (name === "get_task_delay_history") return "SUMMARIZE_TASK_DELAYS";
+  if (args.mode === "count") return "COUNT_TASKS";
+  if (args.mode === "stats") return "USER_STATS";
+  if (args.overdue) return "LIST_OVERDUE_TASKS";
+  if (args.delay_count) return "LIST_TASKS_WITH_MIN_DELAYS";
+  return "LIST_TASKS";
 };
 
 export const queryTasksWithAI = async (req, res) => {
   try {
+    const question = String(req.body?.question || "").trim().slice(0, 500);
+    if (!question) return res.status(400).json({ message: "Please enter a question." });
+
     const users = await visibleUsers(req);
-    const parsed = await interpret(req.body.question, users);
-    console.log("AI parsed query:", JSON.stringify(parsed));
-    const summarizePhrase = /\bsummar(?:ize|ise)\b/i.test(req.body.question);
-    if (summarizePhrase) parsed.intent = "SUMMARIZE_TASK_DELAYS";
-    if (parsed.intent === "SUMMARIZE_TASK_DELAYS" && !parsed.task_title) {
-      parsed.task_title = await inferTaskTitle(req, req.body.question);
+    const { answer, last, results } = await runAssistant(req, question, users);
+    const multiCount =
+      results.length > 1 && results.every((r) => r.name === "query_tasks" && r.args?.mode === "count");
+    const response = { answer };
+
+        if (multiCount) {
+      response.intent = "MULTI_COUNT";
+    } else if (last?.data?.error) {
+      response.message = last.data.error;
+      response.suggestions = last.data.suggestions || [];
+      if (last.data.tasks) response.tasks = last.data.tasks;
+    } else if (last?.name === "query_tasks") {
+      const { data, args } = last;
+      response.intent = legacyIntent(last.name, args);
+      response.matched_users = data.matched_users;
+      response.status = args.status || null;
+      if (data.count !== undefined) response.count = data.count;
+      if (data.tasks) response.tasks = data.tasks;
+      if (data.stats) response.stats = data.stats;
+    } else if (last?.name === "get_task_delay_history") {
+      response.intent = "SUMMARIZE_TASK_DELAYS";
+      response.task = last.data.task;
+      response.delays = last.data.delays;
+      response.summary = answer;
+    } else if (last?.name === "get_delay_reasons") {
+      response.intent = "DELAY_REASONS";
+      response.delays = last.data.delays;
+      response.summary = answer;
+    } else if (last?.name === "search_tasks_by_meaning") {
+      response.intent = "SEMANTIC_SEARCH";
+      response.tasks = last.data.tasks;
     }
-
-    const overduePhrase = /\boverdue\b/i.test(req.body.question);
-    if (overduePhrase) {
-      parsed.intent = "LIST_OVERDUE_TASKS";
-      parsed.status = null;
-    }
-
-    const delayPhrase = req.body.question.match(/more than\s+(\d+)\s+delays?/i);
-    const lessPhrase = req.body.question.match(/less than\s+(\d+)\s+delays?/i);
-    const atLeastPhrase = req.body.question.match(/at least\s+(\d+)\s+delays?/i);
-    const exactPhrase = req.body.question.match(/exactly\s+(\d+)\s+delays?/i);
-    let delayOperator = ">";
-    if (lessPhrase) { parsed.min_delays = Number(lessPhrase[1]); delayOperator = "<"; parsed.intent = "LIST_TASKS"; }
-    if (atLeastPhrase) { parsed.min_delays = Number(atLeastPhrase[1]); delayOperator = ">="; parsed.intent = "LIST_TASKS"; }
-    if (exactPhrase) { parsed.min_delays = Number(exactPhrase[1]); delayOperator = "="; parsed.intent = "LIST_TASKS"; }
-
-    if (delayPhrase) {
-      parsed.min_delays = Number(delayPhrase[1]);
-      parsed.intent = "LIST_TASKS_WITH_MIN_DELAYS";
-    }
-    if (parsed.intent === "UNSUPPORTED") {
-      return res.status(400).json({ message: "I can search tasks by status, assignee, title, overdue state, and delay count, or summarize task delays." });
-    }
-
-    const userMatch = resolveUser(parsed.assignee_name, users);
-    const questionLower = req.body.question.toLowerCase();
-    const mentionedUsers = users.filter((user) => mentionsUser(questionLower, user.name));
-    const assigneeIds = mentionedUsers.length > 0 ? mentionedUsers.map((user) => user.id) : (userMatch.user ? [userMatch.user.id] : undefined);
-    if (parsed.assignee_name && !userMatch.user && mentionedUsers.length === 0) {
-      return res.status(404).json({ message: "I could not confidently match that user.", suggestions: userMatch.suggestions || [] });
-    }
-
-    if (parsed.intent === "COUNT_TASKS") {
-      const tasks = await listTasks(req, { assigneeIds, status: parsed.status || undefined, title: parsed.task_title || undefined, minDelays: parsed.min_delays ?? undefined, delayOperator });
-      return res.json({ intent: parsed.intent, matched_users: mentionedUsers.length ? mentionedUsers.map((user) => user.name) : (userMatch.user ? [userMatch.user.name] : []), status: parsed.status || null, count: tasks.length });
-    }
-
-    if (parsed.intent === "USER_STATS") {
-      const tasks = await listTasks(req, { assigneeIds });
-      const stats = { total_tasks: tasks.length, ongoing_tasks: tasks.filter((task) => task.status === "ONGOING").length, delayed_tasks: tasks.filter((task) => task.status === "DELAYED").length, completed_tasks: tasks.filter((task) => task.status === "COMPLETED").length, overdue_tasks: tasks.filter((task) => task.status !== "COMPLETED" && task.feedback_date && new Date(task.feedback_date) < new Date()).length };
-      return res.json({ intent: parsed.intent, matched_users: mentionedUsers.length ? mentionedUsers.map((user) => user.name) : (userMatch.user ? [userMatch.user.name] : []), stats });
-    }
-
-    if (parsed.intent === "LIST_TASKS") {
-      const tasks = await listTasks(req, { assigneeIds, status: parsed.status || undefined, title: parsed.task_title || undefined, minDelays: parsed.min_delays ?? undefined, delayOperator });
-      return res.json({ intent: parsed.intent, matched_users: mentionedUsers.length ? mentionedUsers.map((user) => user.name) : (userMatch.user ? [userMatch.user.name] : []), status: parsed.status || null, tasks });
-    }
-
-    if (parsed.intent === "LIST_OVERDUE_TASKS") {
-      const tasks = await listTasks(req, { overdue: true, assigneeIds });
-      return res.json({ intent: parsed.intent, matched_users: mentionedUsers.length ? mentionedUsers.map((user) => user.name) : (userMatch.user ? [userMatch.user.name] : []), corrected_from: userMatch.correctedFrom || null, tasks });
-    }
-
-    if (parsed.intent === "LIST_TASKS_WITH_MIN_DELAYS") {
-      const tasks = await listTasks(req, { assigneeIds, minDelays: parsed.min_delays ?? 2, delayOperator });
-      return res.json({ intent: parsed.intent, matched_users: mentionedUsers.length ? mentionedUsers.map((user) => user.name) : (userMatch.user ? [userMatch.user.name] : []), corrected_from: userMatch.correctedFrom || null, tasks });
-    }
-
-    if (parsed.intent === "SUMMARIZE_TASK_DELAYS" && !parsed.task_title) {
-      return res.status(404).json({ message: "Please include the task title you want summarized." });
-    }
-
-    const values = [];
-    let where = accessScope(req, values);
-    where += " AND t.title LIKE ?";
-    values.push(`%${parsed.task_title || ""}%`);
-    const [tasks] = await db.query(
-      `SELECT t.id, t.title, t.description, t.status, t.feedback_date, assignee.name AS assignee_name, COUNT(d.id) AS delay_count
-       FROM tasks t INNER JOIN users assignee ON assignee.id = t.assigned_to LEFT JOIN task_delays d ON d.task_id = t.id
-       WHERE ${where}
-       GROUP BY t.id, t.title, t.description, t.status, t.feedback_date, assignee.name
-       ORDER BY t.updated_at DESC LIMIT 4`,
-      values
-    );
-    if (tasks.length === 0) return res.status(404).json({ message: "No matching task was found." });
-    if (tasks.length > 1) return res.status(409).json({ message: "I found multiple matching tasks.", tasks: tasks.map(taskDto) });
-
-    const [delays] = await db.query("SELECT old_date, new_date, reason, created_at FROM task_delays WHERE task_id = ? ORDER BY created_at ASC", [tasks[0].id]);
-    return res.json({ intent: parsed.intent, task: taskDto(tasks[0]), delays, summary: await summarize(tasks[0], delays) });
+    return res.json(response);
   } catch (error) {
     console.error("AI task query failed", {
       message: error?.message,
@@ -262,6 +544,8 @@ export const queryTasksWithAI = async (req, res) => {
       cause: error?.cause?.message,
     });
     const missingKey = error.message === "OPENAI_API_KEY is not configured";
-    return res.status(missingKey ? 503 : 500).json({ message: missingKey ? error.message : "Unable to process the task question" });
+    return res.status(missingKey ? 503 : 500).json({
+      message: missingKey ? error.message : "Unable to process the task question",
+    });
   }
 };

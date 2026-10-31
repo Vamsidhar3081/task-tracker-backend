@@ -1,6 +1,7 @@
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { db } from "../config/db.js";
+import { refreshTaskEmbedding, removeTaskEmbeddings } from "../services/taskEmbeddingSync.js";
 
 const mapTask = (row) => ({
   id: row.id,
@@ -183,7 +184,7 @@ export const deleteUser = async (req, res) => {
 
     await connection.query("DELETE FROM users WHERE id = ?", [userId]);
     await connection.commit();
-
+    removeTaskEmbeddings(taskIds);
     return res.json({ message: "User deleted successfully" });
   } catch (err) {
     await connection.rollback();
@@ -257,7 +258,7 @@ export const createTask = async (req, res) => {
        VALUES (?, ?, ?, ?, ${status === "COMPLETED" ? "NOW()" : "NULL"}, ?, ?)`,
       [title, description, feedback_date, status, creatorId, assigneeId]
     );
-
+    refreshTaskEmbedding(result.insertId);
     return res.status(201).json({
       message: "Task created successfully",
       taskId: result.insertId,
@@ -428,6 +429,10 @@ export const updateTask = async (req, res) => {
       values
     );
 
+    if (title !== undefined || description !== undefined || assignedTo !== undefined) {
+      refreshTaskEmbedding(taskId);
+    }
+
     return res.json({ message: "Task updated successfully" });
   } catch (err) {
     const statusCode =
@@ -570,6 +575,7 @@ export const deleteTask = async (req, res) => {
       [taskId]
     );
 
+    refreshTaskEmbedding(taskId);
     return res.json({ message: "Task deleted successfully" });
   } catch (err) {
     return res.status(500).json({
@@ -634,6 +640,42 @@ export const getTaskById = async (req, res) => {
       ...mapTask(task),
       delay_count: delays.length,
       delays,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      message: "Something went wrong",
+      error: err.message,
+    });
+  }
+};
+
+export const getTaskStats = async (req, res) => {
+  try {
+    const values = [];
+    let scope = buildTaskScope(req, values);
+
+    if (req.user.role === "ADMIN" && req.query.assignedTo) {
+      scope += " AND t.assigned_to = ?";
+      values.push(req.query.assignedTo);
+    }
+
+    const [[row]] = await db.query(
+      `SELECT
+         COUNT(*) AS total_tasks,
+         COALESCE(SUM(t.status = 'COMPLETED'), 0) AS completed_tasks,
+         COALESCE(SUM(t.status = 'DELAYED'), 0) AS delayed_tasks,
+         COALESCE(SUM(t.status = 'ONGOING'), 0) AS ongoing_tasks,
+         COALESCE(SUM(t.status != 'COMPLETED' AND t.feedback_date < CURDATE()), 0) AS overdue_tasks
+       FROM tasks t ${scope}`,
+      values
+    );
+
+    return res.json({
+      total_tasks: Number(row.total_tasks),
+      completed_tasks: Number(row.completed_tasks),
+      delayed_tasks: Number(row.delayed_tasks),
+      ongoing_tasks: Number(row.ongoing_tasks),
+      overdue_tasks: Number(row.overdue_tasks),
     });
   } catch (err) {
     return res.status(500).json({

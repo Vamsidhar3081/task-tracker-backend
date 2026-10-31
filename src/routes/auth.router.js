@@ -11,6 +11,7 @@ import {
   deleteUser,
   delayTask,
   getTaskById,
+  getTaskStats,
   getTasks,
   getUsers,
   loginUser,
@@ -42,6 +43,7 @@ router.delete("/users/:userId", authMiddleware, requireAdmin, deleteUser);
 
 router.post("/createtask", authMiddleware, validateRequest(createTasksSchema), createTask);
 router.get("/gettasks", authMiddleware, getTasks);
+router.get("/taskstats", authMiddleware, getTaskStats);
 router.put("/updateticket/:taskId", authMiddleware, validateRequest(updateTasksSchema), updateTask);
 router.post("/tasks/:taskId/delay", authMiddleware, validateRequest(delayTaskSchema), delayTask);
 router.patch("/tasks/:taskId/complete", authMiddleware, completeTask);
