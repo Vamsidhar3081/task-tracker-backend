@@ -9,7 +9,7 @@ const app = express();
 app.use(
   cors({
     origin:  [
-    "http://localhost:5173",
+    // "http://localhost:5173",
     "https://task-tracker-9b99.vercel.app"
   ],
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],

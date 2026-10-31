@@ -131,7 +131,6 @@ Never commit the `.env` file or expose the API key in the frontend.
 4. Create the embeddings table and embed existing tasks
 
 ```bash
-node src/scripts/createEmbeddingsTable.js
 node src/scripts/embedTasks.js
 ```
 
