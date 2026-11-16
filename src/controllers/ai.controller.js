@@ -130,7 +130,7 @@ const tools = [
             },
             required: ["op", "value"],
           },
-          keyword: { type: "string", description: "Exact text to match in the task title or description." },
+          keyword: { type: "string", description: "Exact text to match in the task title or description. Always use the corrected spelling." },
         },
         required: ["mode"],
       },
@@ -140,8 +140,7 @@ const tools = [
     type: "function",
     function: {
       name: "get_task_delay_history",
-      description:
-        "Get one specific task and its delay history (old date, new date, reason). Use only when the user names a single task and asks why it was delayed or wants a summary of its delays. Do NOT use this for general questions about many tasks; use get_delay_reasons for those.",
+      description: "Get one specific task with its full details (title, description, status, feedback date, assignee) and its delay history (old date, new date, reason). Use it when the user names a single task and asks to summarize, explain, describe it, or asks about its status or delays. Do NOT use this for general questions about many tasks; use get_delay_reasons for those.",
       parameters: {
         type: "object",
         properties: { task_title: { type: "string", description: "Title or part of the title of the task." } },
@@ -394,12 +393,24 @@ const runSemanticSearch = async (req, { query }) => {
 
 /* ---------- keep what the model reads small and cheap ---------- */
 
+// const forModel = (data) => {
+//   if (!data.tasks) return data;
+//   return {
+//     ...data,
+//     total_returned: data.tasks.length,
+//     tasks: data.tasks.slice(0, MODEL_ROWS).map(({ description, ...rest }) => rest),
+//   };
+// };
+
 const forModel = (data) => {
   if (!data.tasks) return data;
+  const keepDescription = data.tasks.length <= 5;
   return {
     ...data,
     total_returned: data.tasks.length,
-    tasks: data.tasks.slice(0, MODEL_ROWS).map(({ description, ...rest }) => rest),
+    tasks: data.tasks.slice(0, MODEL_ROWS).map(({ description, ...rest }) =>
+      keepDescription ? { ...rest, description: String(description ?? "").slice(0, 300) } : rest
+    ),
   };
 };
 
@@ -415,9 +426,10 @@ Rules:
 - When the user asks for several numbers at once, such as total, completed, delayed and overdue tasks, call query_tasks once with mode=stats instead of several count calls, then report every number from the result.
 - For questions about a topic or theme, such as "tasks related to payment problems", "anything about login issues" or "tasks similar to X", call search_tasks_by_meaning once. Write the query as a short descriptive phrase about the topic, adding only a few closely related terms, for example "payment gateway and checkout problems, online transactions, refunds" for a payment question, or "login page problems, sign in failures" for a login question. Do not add loosely related words. Do NOT try several keyword guesses with query_tasks for these. Only mention tasks that were returned, and say that results are ranked by similarity, so the last ones may be only loosely related. If none are returned, say no related tasks were found.
 - For ANY general question about why tasks are delayed, common delay reasons, or delay patterns, you MUST call get_delay_reasons first and only. Do NOT call query_tasks or get_task_delay_history for these questions. After it returns, describe only what the returned reasons say: group similar reasons, mention how many entries there are, and quote the actual reasons. Do not explain how the system works and do not add reasons that are not in the data. If the reasons are unclear or meaningless, say so. Start by stating the total number of entries. Put every entry in exactly one group, and make sure the group counts add up to the total before answering; if they don't, recount.
-- To explain why one specific named task was delayed, call get_task_delay_history and summarize only the returned data. Mention the number of delays and the recorded reasons. If there are none, say no delays are recorded. If several tasks match the title, say so and summarize each one separately, naming its assignee and description.
+- To summarize, explain or describe one specific named task (for example "summarize the mobile view task"), call get_task_delay_history with the task title. Then write a 2 to 3 sentence summary in your own words from the returned data only: what the task is about (from its description), its current status, its feedback date, who it is assigned to, and how many delays it has with the recorded reasons. If there are no delays, say no delays are recorded. If several tasks match the title, say so and summarize each one separately, naming its assignee. Never answer a summary request with only a list of tasks.
 - If a tool returns an error or suggestions, tell the user and ask them to clarify. Never invent users or tasks.
 - If the question is unrelated to tasks, say you can only help with task questions.
+- The user may make spelling mistakes. Silently correct obvious typos in topics, task titles and names before calling any tool, and pass the corrected spelling in the tool arguments (for example "databace" means "database"). A question that is just a topic word or phrase, such as "database", should be treated as a topic question and use search_tasks_by_meaning.
 - Keep answers short. Full task lists are shown to the user separately, so give the key number or a one-line summary instead of repeating every task. If results are truncated, say so.
 - ${req.user.role === "ADMIN" ? "The current user is an admin and can see all users." : "The current user is a regular user and can only see their own tasks."}
 Known users: ${JSON.stringify(users.map((u) => u.name).slice(0, 200))}`;

@@ -10,6 +10,7 @@ import {
   deleteTask,
   deleteUser,
   delayTask,
+  getSetupStatus,
   getTaskById,
   getTaskStats,
   getTasks,
@@ -34,6 +35,7 @@ router.get("/me", authMiddleware, (req, res) => {
   res.json(req.user);
 });
 
+router.get("/setup-status", getSetupStatus);
 router.post("/register", validateRequest(registerSchema), registerUser);
 router.post("/login", validateRequest(loginSchema), loginUser);
 

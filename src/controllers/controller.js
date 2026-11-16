@@ -19,6 +19,11 @@ const mapTask = (row) => ({
   is_overdue: row.is_overdue,
 });
 
+const serverError = (res, label, err) => {
+  console.error(`${label} failed:`, err);
+  return res.status(500).json({ message: "Something went wrong" });
+};
+
 const ensureAssignableUser = async (assignedTo) => {
   const [users] = await db.query(
     "SELECT id, role FROM users WHERE id = ?",
@@ -53,35 +58,46 @@ const setCompletedColumns = (status) => {
 
 export const registerUser = async (req, res) => {
   try {
-    const { name, email, password } = req.body;
+    const name = req.body.name.trim();
+    const email = req.body.email.trim().toLowerCase();
+    const { password } = req.body;
 
-    const [existing] = await db.query(
-      "SELECT id FROM users WHERE email = ?",
-      [email]
-    );
-
-    if (existing.length > 0) {
-      return res.status(400).json({ message: "User already exists" });
+    const [[{ total }]] = await db.query("SELECT COUNT(*) AS total FROM users");
+    if (Number(total) > 0) {
+      return res.status(403).json({
+        message: "Sign up is closed. Ask your admin to create your account.",
+      });
     }
 
     const hashed = await bcrypt.hash(password, 10);
     await db.query(
-      "INSERT INTO users(name, email, password_hash, role) VALUES (?, ?, ?, 'USER')",
+      "INSERT INTO users(name, email, password_hash, role) VALUES (?, ?, ?, 'ADMIN')",
       [name, email, hashed]
     );
 
-    return res.status(201).json({ message: "User registered successfully" });
+    return res.status(201).json({ message: "Admin account created successfully" });
   } catch (err) {
-    return res.status(500).json({
-      message: "Something went wrong",
-      error: err.message,
-    });
+    if (err.code === "ER_DUP_ENTRY") {
+      return res.status(400).json({ message: "User already exists" });
+    }
+    return serverError(res, "registerUser", err);
+  }
+};
+
+export const getSetupStatus = async (_req, res) => {
+  try {
+    const [[{ total }]] = await db.query("SELECT COUNT(*) AS total FROM users");
+    return res.json({ needsSetup: Number(total) === 0 });
+  } catch (err) {
+    return serverError(res, "getSetupStatus", err);
   }
 };
 
 export const createUser = async (req, res) => {
   try {
-    const { name, email, password, role = "USER" } = req.body;
+    const name = req.body.name.trim();
+    const email = req.body.email.trim().toLowerCase();
+    const { password, role = "USER" } = req.body;
 
     const [existing] = await db.query(
       "SELECT id FROM users WHERE email = ?",
@@ -100,10 +116,10 @@ export const createUser = async (req, res) => {
 
     return res.status(201).json({ message: "User created successfully" });
   } catch (err) {
-    return res.status(500).json({
-      message: "Something went wrong",
-      error: err.message,
-    });
+    if (err.code === "ER_DUP_ENTRY") {
+      return res.status(400).json({ message: "User already exists" });
+    }
+    return serverError(res, "createUser", err);
   }
 };
 
@@ -127,10 +143,7 @@ export const getUsers = async (_req, res) => {
 
     return res.json({ users });
   } catch (err) {
-    return res.status(500).json({
-      message: "Something went wrong",
-      error: err.message,
-    });
+    return serverError(res, "getUsers", err);
   }
 };
 
@@ -188,10 +201,7 @@ export const deleteUser = async (req, res) => {
     return res.json({ message: "User deleted successfully" });
   } catch (err) {
     await connection.rollback();
-    return res.status(500).json({
-      message: "Something went wrong",
-      error: err.message,
-    });
+    return serverError(res, "deleteUser", err);
   } finally {
     connection.release();
   }
@@ -199,7 +209,9 @@ export const deleteUser = async (req, res) => {
 
 export const loginUser = async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const email = req.body.email.trim().toLowerCase();
+    const { password } = req.body;
+
     const [users] = await db.query(
       "SELECT id, name, email, role, password_hash FROM users WHERE email = ?",
       [email]
@@ -233,10 +245,7 @@ export const loginUser = async (req, res) => {
       },
     });
   } catch (err) {
-    return res.status(500).json({
-      message: "Something went wrong",
-      error: err.message,
-    });
+    return serverError(res, "loginUser", err);
   }
 };
 
@@ -264,15 +273,14 @@ export const createTask = async (req, res) => {
       taskId: result.insertId,
     });
   } catch (err) {
-    const statusCode =
+    const isKnown =
       err.message === "Assigned user not found" ||
-      err.message === "Tasks can only be assigned to USER accounts"
-        ? 400
-        : 500;
+      err.message === "Tasks can only be assigned to USER accounts";
 
-    return res.status(statusCode).json({
-      message: err.message || "Something went wrong",
-    });
+    if (isKnown) {
+      return res.status(400).json({ message: err.message });
+    }
+    return serverError(res, "createTask", err);
   }
 };
 
@@ -280,8 +288,8 @@ export const getTasks = async (req, res) => {
   try {
     const { date, status, search, filter, assignedTo, page = 1, limit = 10 } = req.query;
 
-    const pageNum = Math.max(parseInt(page, 10), 1);
-    const limitNum = Math.min(parseInt(limit, 10), 100);
+    const pageNum = Math.max(parseInt(page, 10) || 1, 1);
+    const limitNum = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 100);
     const offset = (pageNum - 1) * limitNum;
 
     const values = [];
@@ -356,10 +364,7 @@ export const getTasks = async (req, res) => {
       task: task.map(mapTask),
     });
   } catch (err) {
-    return res.status(500).json({
-      message: "Something went wrong",
-      error: err.message,
-    });
+    return serverError(res, "getTasks", err);
   }
 };
 
@@ -435,15 +440,14 @@ export const updateTask = async (req, res) => {
 
     return res.json({ message: "Task updated successfully" });
   } catch (err) {
-    const statusCode =
+    const isKnown =
       err.message === "Assigned user not found" ||
-      err.message === "Tasks can only be assigned to USER accounts"
-        ? 400
-        : 500;
+      err.message === "Tasks can only be assigned to USER accounts";
 
-    return res.status(statusCode).json({
-      message: err.message || "Something went wrong",
-    });
+    if (isKnown) {
+      return res.status(400).json({ message: err.message });
+    }
+    return serverError(res, "updateTask", err);
   }
 };
 
@@ -453,6 +457,10 @@ export const delayTask = async (req, res) => {
   try {
     const taskId = Number(req.params.taskId);
     const { reason, newDate } = req.body;
+
+    if (Number.isNaN(taskId)) {
+      return res.status(400).json({ message: "Invalid task id" });
+    }
 
     const [tasks] = await connection.query(
       "SELECT id, feedback_date, status, assigned_to FROM tasks WHERE id = ? AND is_deleted = 0",
@@ -500,10 +508,7 @@ export const delayTask = async (req, res) => {
     return res.json({ message: "Task delayed successfully" });
   } catch (err) {
     await connection.rollback();
-    return res.status(500).json({
-      message: "Something went wrong",
-      error: err.message,
-    });
+    return serverError(res, "delayTask", err);
   } finally {
     connection.release();
   }
@@ -512,6 +517,11 @@ export const delayTask = async (req, res) => {
 export const completeTask = async (req, res) => {
   try {
     const taskId = Number(req.params.taskId);
+
+    if (Number.isNaN(taskId)) {
+      return res.status(400).json({ message: "Invalid task id" });
+    }
+
     const [tasks] = await db.query(
       "SELECT id, status, assigned_to FROM tasks WHERE id = ? AND is_deleted = 0",
       [taskId]
@@ -540,10 +550,7 @@ export const completeTask = async (req, res) => {
 
     return res.json({ message: "Task completed successfully" });
   } catch (err) {
-    return res.status(500).json({
-      message: "Something went wrong",
-      error: err.message,
-    });
+    return serverError(res, "completeTask", err);
   }
 };
 
@@ -578,10 +585,7 @@ export const deleteTask = async (req, res) => {
     refreshTaskEmbedding(taskId);
     return res.json({ message: "Task deleted successfully" });
   } catch (err) {
-    return res.status(500).json({
-      message: "Something went wrong",
-      error: err.message,
-    });
+    return serverError(res, "deleteTask", err);
   }
 };
 
@@ -642,10 +646,7 @@ export const getTaskById = async (req, res) => {
       delays,
     });
   } catch (err) {
-    return res.status(500).json({
-      message: "Something went wrong",
-      error: err.message,
-    });
+    return serverError(res, "getTaskById", err);
   }
 };
 
@@ -678,9 +679,6 @@ export const getTaskStats = async (req, res) => {
       overdue_tasks: Number(row.overdue_tasks),
     });
   } catch (err) {
-    return res.status(500).json({
-      message: "Something went wrong",
-      error: err.message,
-    });
+    return serverError(res, "getTaskStats", err);
   }
 };

@@ -6,31 +6,31 @@ today.setHours(0, 0, 0, 0);
 const registerSchema = joi
   .object({
     name: joi.string().trim().min(3).max(100).required(),
-    email: joi.string().email().required(),
-    password: joi.string().min(6).required(),
+    email: joi.string().trim().email().max(150).required(),
+    password: joi.string().min(6).max(72).required(),
   })
   .unknown(false);
 
 const createUserSchema = joi
   .object({
     name: joi.string().trim().min(3).max(100).required(),
-    email: joi.string().email().required(),
-    password: joi.string().min(6).required(),
+    email: joi.string().trim().email().max(150).required(),
+    password: joi.string().min(6).max(72).required(),
     role: joi.valid("USER", "ADMIN").default("USER"),
   })
   .unknown(false);
 
 const loginSchema = joi
   .object({
-    email: joi.string().email().required(),
+    email: joi.string().trim().email().required(),
     password: joi.string().min(6).required(),
   })
   .unknown(false);
 
 const createTasksSchema = joi
   .object({
-    title: joi.string().trim().min(3).max(255).required(),
-    description: joi.string().trim().min(3).required(),
+    title: joi.string().trim().min(3).max(100).required(),
+    description: joi.string().trim().min(3).max(500).required(),
     feedback_date: joi.date().iso().required(),
     status: joi.valid("ONGOING", "DELAYED", "COMPLETED").optional(),
     assignedTo: joi.number().integer().positive().optional(),
@@ -39,8 +39,8 @@ const createTasksSchema = joi
 
 const updateTasksSchema = joi
   .object({
-    title: joi.string().trim().min(3).max(255).optional(),
-    description: joi.string().trim().min(3).optional(),
+    title: joi.string().trim().min(3).max(100).optional(),
+    description: joi.string().trim().min(3).max(500).optional(),
     feedback_date: joi.date().iso().optional(),
     status: joi.valid("ONGOING", "DELAYED", "COMPLETED").optional(),
     assignedTo: joi.number().integer().positive().optional(),
